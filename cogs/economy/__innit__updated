@@ -23,10 +23,9 @@ class Prediction:
         self.result = None
         self.refunded = False
         self.total_bets = 0
-        # Increase initial liquidity significantly to reduce price impact
-        self.initial_liquidity = 30000  # Increased from 100
-        self.liquidity_pool = {option: self.initial_liquidity for option in options}
-        self.k_constant = self.initial_liquidity * self.initial_liquidity  # Adjusted constant product
+        # Start with smaller initial liquidity to make price movements more noticeable
+        self.liquidity_pool = {option: 100 for option in options}
+        self.k_constant = 100 * 100  # Adjusted constant product
 
     def get_price(self, option, shares_to_buy):
         """Calculate price for buying shares using constant product formula"""
@@ -142,32 +141,38 @@ class Prediction:
         """Calculate current prices and potential shares for a given point amount"""
         prices = {}
         
-        # Calculate total bets for probability calculation
-        total_bets = sum(sum(self.bets[option].values()) for option in self.options)
-        if total_bets == 0:
-            # If no bets yet, use equal probabilities
-            base_probability = 100 / len(self.options)
-            probabilities = {option: base_probability for option in self.options}
+        # Calculate total bets for each option
+        total_bets_per_option = {
+            option: sum(self.bets[option].values())
+            for option in self.options
+        }
+        total_all_bets = sum(total_bets_per_option.values())
+        
+        # If no bets yet, use equal probabilities
+        if total_all_bets == 0:
+            probability_per_option = {option: 1/len(self.options) for option in self.options}
         else:
-            # Calculate probabilities based on total bets per option
-            probabilities = {
-                option: (sum(self.bets[option].values()) / total_bets * 100)
+            # Calculate probabilities based on total bets
+            probability_per_option = {
+                option: total_bets_per_option[option] / total_all_bets
                 for option in self.options
             }
-        
+
         for option in self.options:
-            # Calculate actual shares user would get for their points
+            # Calculate shares user would get for their points
             shares = self.calculate_shares_for_points(option, points_to_spend)
             
-            # Calculate actual price per share based on points spent and shares received
+            # Calculate price per share (higher probability = higher price)
             price_per_share = points_to_spend / shares if shares > 0 else float('inf')
+            
+            potential_payout = points_to_spend * (1 / price_per_share) if price_per_share > 0 else 0
             
             prices[option] = {
                 'price_per_share': price_per_share,
                 'potential_shares': shares,
-                'potential_payout': points_to_spend if shares > 0 else 0,
-                'probability': probabilities[option],  # Now based on total bets
-                'total_bets': sum(self.bets[option].values())
+                'potential_payout': potential_payout,
+                'probability': probability_per_option[option] * 100,  # Convert to percentage
+                'total_bets': total_bets_per_option[option]  # Add total bets for this option
             }
         return prices
 
@@ -227,9 +232,10 @@ class AmountInput(discord.ui.Modal, title="Place Your Bet"):
                 await interaction.response.send_message(f"You don't have enough Points! Your balance: {balance:,} Points", ephemeral=True)
                 return
 
-            # Calculate potential shares and payout before placing bet
-            shares = self.prediction.calculate_shares_for_points(self.option, amount)
-            actual_price_per_share = amount / shares if shares > 0 else float('inf')
+            # Calculate potential shares and payout
+            pre_bet_prices = self.prediction.get_current_prices(amount)
+            potential_shares = pre_bet_prices[self.option]['potential_shares']
+            potential_payout = pre_bet_prices[self.option]['potential_payout']
 
             # Transfer points and place bet
             await self.cog.points_manager.transfer_points(interaction.user.id, self.cog.bot.user.id, amount)
@@ -237,8 +243,8 @@ class AmountInput(discord.ui.Modal, title="Place Your Bet"):
                 await interaction.response.send_message(
                     f"Bet placed successfully!\n"
                     f"Amount: {amount:,} Points\n"
-                    f"Shares received: {shares:.2f}\n"
-                    f"Actual price per share: {actual_price_per_share:.2f} Points",
+                    f"Potential shares: {potential_shares:.2f}\n"
+                    f"Potential payout: {potential_payout:.2f} Points",
                     ephemeral=True
                 )
         except ValueError:
@@ -307,20 +313,16 @@ class OptionButtonView(discord.ui.View):
                     )
                     return
 
-                # Calculate prices for a small test amount to get accurate pricing
-                test_amount = 10  # Use small amount for more accurate initial price
-                prices = self.prediction.get_current_prices(test_amount)
+                # Update prices and probabilities
+                prices = self.prediction.get_current_prices(100)
                 market_info = "**Current Market Status**\n\n"
                 
                 for option in self.prediction.options:
                     price_info = prices[option]
-                    shares = price_info['potential_shares']
-                    actual_price = test_amount / shares if shares > 0 else float('inf')
-                    
                     market_info += f"**{option}**\n"
                     market_info += f"• Total Bets: {price_info['total_bets']:,} Points\n"
                     market_info += f"• Probability: {price_info['probability']:.1f}%\n"
-                    market_info += f"• Current Price: {actual_price:.2f} Points/Share\n\n"
+                    market_info += f"• Price: {price_info['price_per_share']:.2f} Points/Share\n\n"
                 
                 # Add total volume
                 total_volume = self.prediction.get_total_bets()
@@ -652,56 +654,97 @@ class Economy(commands.Cog):
             self.active_views.discard(view)
 
     @app_commands.guild_only()
-    @app_commands.command(name="resolve_prediction", description="Vote to resolve a prediction")
+    @app_commands.command(name="resolve_prediction", description="Resolve a prediction")
     async def resolve_prediction_command(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        
-        # Show all unresolved predictions that have ended
+
+        # Only show unresolved predictions created by this user
         unresolved_predictions = [
             pred for pred in self.predictions 
-            if not pred.resolved and pred.end_time <= datetime.datetime.utcnow()
+            if not pred.resolved and pred.creator_id == interaction.user.id
         ]
         
         if not unresolved_predictions:
             await interaction.followup.send(
-                "There are no predictions ready to be resolved.", 
+                "You don't have any unresolved predictions to resolve. "
+                "Only the creator of a prediction can resolve it.", 
                 ephemeral=True
             )
             return
 
-        # Create selection menu for predictions
         class PredictionSelect(discord.ui.Select):
-            def __init__(self, predictions):
+            def __init__(self, predictions, cog):
+                self.cog = cog
                 options = [
                     discord.SelectOption(
-                        label=prediction.question[:100], 
-                        description=f"Ended {prediction.end_time.strftime('%Y-%m-%d %H:%M:%S UTC')}", 
+                        label=prediction.question, 
+                        description=f"Ended at {prediction.end_time.strftime('%Y-%m-%d %H:%M:%S UTC')}", 
                         value=str(index)
                     )
                     for index, prediction in enumerate(predictions)
                 ]
-                super().__init__(
-                    placeholder="Select a prediction to resolve...", 
-                    min_values=1, 
-                    max_values=1, 
-                    options=options
-                )
+                super().__init__(placeholder="Select a prediction to resolve...", min_values=1, max_values=1, options=options)
 
             async def callback(self, interaction: discord.Interaction):
                 selected_index = int(self.values[0])
                 selected_prediction = unresolved_predictions[selected_index]
-                
-                view = ResolutionView(selected_prediction)
-                await interaction.response.send_message(
-                    f"Vote for the winning option for:\n**{selected_prediction.question}**\n"
-                    f"(Requires 3 votes to resolve)",
-                    view=view,
-                    ephemeral=False  # Make voting public
-                )
 
-        view = discord.ui.View()
-        view.add_item(PredictionSelect(unresolved_predictions))
-        await interaction.followup.send("Select a prediction to resolve:", view=view, ephemeral=True)
+                class ResultSelect(discord.ui.Select):
+                    def __init__(self, prediction, cog):
+                        self.prediction = prediction
+                        self.cog = cog
+                        options = [
+                            discord.SelectOption(label=option, value=option)
+                            for option in prediction.options
+                        ]
+                        super().__init__(placeholder="Select the winning option...", min_values=1, max_values=1, options=options)
+
+                    async def callback(self, interaction: discord.Interaction):
+                        result = self.values[0]
+                        if not self.prediction.resolve(result):
+                            await interaction.response.send_message("This prediction has already been resolved!", ephemeral=True)
+                            return
+
+                        # Distribute payouts and notify winners
+                        total_payout = self.prediction.get_total_bets()
+                        winning_users = self.prediction.bets[result].items()
+                        
+                        # Process payouts and notifications for winners
+                        for user_id, original_bet in winning_users:
+                            payout = self.prediction.get_user_payout(user_id)
+                            if payout > 0:
+                                payout_amount = int(payout)
+                                await self.cog.points_manager.add_points(user_id, payout_amount)
+                                profit = payout_amount - original_bet
+                                
+                                try:
+                                    user = await self.cog.bot.fetch_user(user_id)
+                                    await user.send(
+                                        f"🎉 You won {profit:,} Points on '{self.prediction.question}'!\n"
+                                        f"Bet: {original_bet:,} → Payout: {payout_amount:,}"
+                                    )
+                                except Exception as e:
+                                    print(f"Error sending winning notification to user {user_id}: {e}")
+
+                        await interaction.response.send_message(
+                            f"Prediction '{self.prediction.question}' resolved with result: '{result}'. "
+                            f"Payouts have been distributed.", 
+                            ephemeral=True
+                        )
+
+                view = discord.ui.View()
+                view.add_item(ResultSelect(selected_prediction, self.cog))
+                await interaction.response.send_message("Please select the winning option:", view=view, ephemeral=True)
+
+        class PredictionSelectView(discord.ui.View):
+            def __init__(self, predictions, economy_cog):
+                super().__init__()
+                select = PredictionSelect(predictions, economy_cog)
+                self.add_item(select)
+
+        # Pass self (the Economy cog) directly instead of trying to access self.cog
+        view = PredictionSelectView(unresolved_predictions, self)
+        await interaction.followup.send("Please select a prediction to resolve:", view=view, ephemeral=True)
 
     @commands.Cog.listener()
     async def on_prediction_update(self, prediction: Prediction):
@@ -868,74 +911,6 @@ class ListPredictionsView(discord.ui.View):
         """Cleanup when the view is destroyed"""
         self.stop_auto_update()
         self.cog.active_views.discard(self)
-
-class ResolutionButton(discord.ui.Button):
-    def __init__(self, option: str, prediction: Prediction):
-        super().__init__(
-            label=option,
-            style=discord.ButtonStyle.primary,
-            custom_id=f"resolve_{option}"
-        )
-        self.option = option
-        self.prediction = prediction
-        self.votes = set()  # Store user IDs who voted for this option
-        
-    async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id not in self.votes:
-            self.votes.add(interaction.user.id)
-            await interaction.response.send_message(f"You voted for {self.option}", ephemeral=True)
-            
-            # Check if threshold reached (3 votes)
-            if len(self.votes) >= 3:
-                if not self.prediction.resolved:
-                    self.prediction.resolve(self.option)
-                    
-                    # Process payouts and notifications
-                    total_payout = self.prediction.get_total_bets()
-                    winning_users = self.prediction.bets[self.option].items()
-                    
-                    for user_id, original_bet in winning_users:
-                        payout = self.prediction.get_user_payout(user_id)
-                        if payout > 0:
-                            payout_amount = int(payout)
-                            await interaction.client.points_manager.add_points(user_id, payout_amount)
-                            profit = payout_amount - original_bet
-                            
-                            try:
-                                user = await interaction.client.fetch_user(user_id)
-                                await user.send(
-                                    f"🎉 You won {profit:,} Points on '{self.prediction.question}'!\n"
-                                    f"Bet: {original_bet:,} → Payout: {payout_amount:,}"
-                                )
-                            except Exception as e:
-                                print(f"Error sending winning notification to user {user_id}: {e}")
-                    
-                    # Update the message to show resolution
-                    view = self.view
-                    for child in view.children:
-                        child.disabled = True
-                        if child.custom_id == f"resolve_{self.option}":
-                            child.style = discord.ButtonStyle.success
-                        else:
-                            child.style = discord.ButtonStyle.danger
-                    
-                    await interaction.message.edit(
-                        content=f"Market resolved! Winning option: {self.option}",
-                        view=view
-                    )
-                    
-            else:
-                # Update button label to show vote count
-                self.label = f"{self.option} ({len(self.votes)}/3)"
-                await interaction.message.edit(view=self.view)
-        else:
-            await interaction.response.send_message("You have already voted!", ephemeral=True)
-
-class ResolutionView(discord.ui.View):
-    def __init__(self, prediction: Prediction):
-        super().__init__(timeout=None)
-        for option in prediction.options:
-            self.add_item(ResolutionButton(option, prediction))
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(Economy(bot))
