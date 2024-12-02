@@ -416,7 +416,7 @@ class Economy(commands.Cog):
             
             # Send confirmation message
             await interaction.followup.send(
-                f"Prediction created by {interaction.user.name}:\n"
+                f"Prediction created:\n"
                 f"Question: {question}\n"
                 f"Options: {', '.join(options_list)}\n"
                 f"Duration: {duration_str}\n"
@@ -614,7 +614,7 @@ class Economy(commands.Cog):
 
             for prediction in self.predictions:
                 prices = prediction.get_current_prices(100)
-                combined_data = (prediction.question, prediction, prices, prediction.creator_id)
+                combined_data = (prediction.question, prediction, prices)
 
                 if prediction.resolved:
                     if prediction.refunded:
@@ -629,10 +629,9 @@ class Economy(commands.Cog):
             # Add markets to embed using the same create_market_display method
             if active_markets:
                 current_embed.add_field(name="🟢 Active Markets", value="\u200b", inline=False)
-                for question, prediction, prices, creator_id in active_markets:
-                    creator_name = (await self.bot.fetch_user(creator_id)).name
+                for question, prediction, prices in active_markets:
                     current_embed.add_field(
-                        name=f"📊 {question} (Created by: {creator_name})",
+                        name=f"📊 {question}",
                         value=view.create_market_display(prediction, prices),
                         inline=False
                     )
@@ -655,14 +654,6 @@ class Economy(commands.Cog):
     @app_commands.guild_only()
     @app_commands.command(name="resolve_prediction", description="Vote to resolve a prediction")
     async def resolve_prediction_command(self, interaction: discord.Interaction):
-        # Check if the user has the required roles
-        allowed_role_ids = {1301959367536672838}
-        user_roles = {role.id for role in interaction.user.roles}
-
-        if not user_roles.intersection(allowed_role_ids):
-            await interaction.response.send_message("You do not have permission to resolve predictions.", ephemeral=True)
-            return
-        
         await interaction.response.defer(ephemeral=True)
         
         # Show all unresolved predictions that have ended
@@ -819,7 +810,7 @@ class ListPredictionsView(discord.ui.View):
             # Process each prediction
             for prediction in self.cog.predictions:
                 prices = prediction.get_current_prices(100)
-                combined_data = (prediction.question, prediction, prices, prediction.creator_id)
+                combined_data = (prediction.question, prediction, prices)
 
                 if prediction.resolved:
                     if prediction.refunded:
@@ -834,20 +825,18 @@ class ListPredictionsView(discord.ui.View):
             # Add markets to embed
             if active_markets:
                 current_embed.add_field(name="🟢 Active Markets", value="\u200b", inline=False)
-                for question, prediction, prices, creator_id in active_markets:
-                    creator_name = (await self.bot.fetch_user(creator_id)).name
+                for question, prediction, prices in active_markets:
                     current_embed.add_field(
-                        name=f"📊 {question} (Created by: {creator_name})",
+                        name=f"📊 {question}",
                         value=self.create_market_display(prediction, prices),
                         inline=False
                     )
 
             if inactive_markets:
                 current_embed.add_field(name="🟡 Pending Resolution", value="\u200b", inline=False)
-                for question, prediction, prices, creator_id in inactive_markets:
-                    creator_name = (await self.bot.fetch_user(creator_id)).name
+                for question, prediction, prices in inactive_markets:
                     current_embed.add_field(
-                        name=f"📊 {question} (Created by: {creator_name})",
+                        name=f"📊 {question}",
                         value=self.create_market_display(prediction, prices),
                         inline=False
                     )
