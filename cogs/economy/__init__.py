@@ -611,6 +611,7 @@ class Economy(commands.Cog):
             inactive_markets = []
             resolved_markets = []
             refunded_markets = []
+            pending_resolution_markets = []  # New list for pending resolution
 
             for prediction in self.predictions:
                 prices = prediction.get_current_prices(100)
@@ -626,10 +627,25 @@ class Economy(commands.Cog):
                 else:
                     active_markets.append(combined_data)
 
+                # Check for pending resolution
+                if prediction.end_time <= datetime.datetime.utcnow() and not prediction.resolved:
+                    pending_resolution_markets.append(combined_data)  # Add to pending resolution
+
             # Add markets to embed using the same create_market_display method
             if active_markets:
                 current_embed.add_field(name="🟢 Active Markets", value="\u200b", inline=False)
                 for question, prediction, prices, creator_id in active_markets:
+                    creator_name = (await self.bot.fetch_user(creator_id)).name
+                    current_embed.add_field(
+                        name=f"📊 {question} (Created by: {creator_name})",
+                        value=view.create_market_display(prediction, prices),
+                        inline=False
+                    )
+
+            # Add pending resolution markets
+            if pending_resolution_markets:
+                current_embed.add_field(name="🟡 Pending Resolution", value="\u200b", inline=False)
+                for question, prediction, prices, creator_id in pending_resolution_markets:
                     creator_name = (await self.bot.fetch_user(creator_id)).name
                     current_embed.add_field(
                         name=f"📊 {question} (Created by: {creator_name})",
@@ -656,7 +672,7 @@ class Economy(commands.Cog):
     @app_commands.command(name="resolve_prediction", description="Vote to resolve a prediction")
     async def resolve_prediction_command(self, interaction: discord.Interaction):
         # Check if the user has the required roles
-        allowed_role_ids = {1301959367536672838}
+        allowed_role_ids = {1301959367536672838, 1301958607046443018, 1301958999092236389}
         user_roles = {role.id for role in interaction.user.roles}
 
         if not user_roles.intersection(allowed_role_ids):
@@ -703,7 +719,7 @@ class Economy(commands.Cog):
                 view = ResolutionView(selected_prediction)
                 await interaction.response.send_message(
                     f"Vote for the winning option for:\n**{selected_prediction.question}**\n"
-                    f"(Requires 3 votes to resolve)",
+                    f"(Requires 2 votes to resolve)",
                     view=view,
                     ephemeral=False  # Make voting public
                 )
@@ -815,6 +831,7 @@ class ListPredictionsView(discord.ui.View):
             inactive_markets = []
             resolved_markets = []
             refunded_markets = []
+            pending_resolution_markets = []  # New list for pending resolution
 
             # Process each prediction
             for prediction in self.cog.predictions:
@@ -831,6 +848,10 @@ class ListPredictionsView(discord.ui.View):
                 else:
                     active_markets.append(combined_data)
 
+                # Check for pending resolution
+                if prediction.end_time <= datetime.datetime.utcnow() and not prediction.resolved:
+                    pending_resolution_markets.append(combined_data)  # Add to pending resolution
+
             # Add markets to embed
             if active_markets:
                 current_embed.add_field(name="🟢 Active Markets", value="\u200b", inline=False)
@@ -842,9 +863,10 @@ class ListPredictionsView(discord.ui.View):
                         inline=False
                     )
 
-            if inactive_markets:
+            # Add pending resolution markets
+            if pending_resolution_markets:
                 current_embed.add_field(name="🟡 Pending Resolution", value="\u200b", inline=False)
-                for question, prediction, prices, creator_id in inactive_markets:
+                for question, prediction, prices, creator_id in pending_resolution_markets:
                     creator_name = (await self.bot.fetch_user(creator_id)).name
                     current_embed.add_field(
                         name=f"📊 {question} (Created by: {creator_name})",
@@ -890,57 +912,75 @@ class ResolutionButton(discord.ui.Button):
         self.option = option
         self.prediction = prediction
         self.votes = set()  # Store user IDs who voted for this option
+        self.user_votes = set()  # Store user IDs who voted for any option in this prediction
         
     async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id not in self.votes:
-            self.votes.add(interaction.user.id)
-            await interaction.response.send_message(f"You voted for {self.option}", ephemeral=True)
-            
-            # Check if threshold reached (3 votes)
-            if len(self.votes) >= 3:
-                if not self.prediction.resolved:
-                    self.prediction.resolve(self.option)
-                    
-                    # Process payouts and notifications
-                    total_payout = self.prediction.get_total_bets()
-                    winning_users = self.prediction.bets[self.option].items()
-                    
-                    for user_id, original_bet in winning_users:
-                        payout = self.prediction.get_user_payout(user_id)
-                        if payout > 0:
-                            payout_amount = int(payout)
-                            await interaction.client.points_manager.add_points(user_id, payout_amount)
-                            profit = payout_amount - original_bet
-                            
-                            try:
-                                user = await interaction.client.fetch_user(user_id)
-                                await user.send(
-                                    f"🎉 You won {profit:,} Points on '{self.prediction.question}'!\n"
-                                    f"Bet: {original_bet:,} → Payout: {payout_amount:,}"
-                                )
-                            except Exception as e:
-                                print(f"Error sending winning notification to user {user_id}: {e}")
-                    
-                    # Update the message to show resolution
-                    view = self.view
-                    for child in view.children:
-                        child.disabled = True
-                        if child.custom_id == f"resolve_{self.option}":
-                            child.style = discord.ButtonStyle.success
-                        else:
-                            child.style = discord.ButtonStyle.danger
-                    
-                    await interaction.message.edit(
-                        content=f"Market resolved! Winning option: {self.option}",
-                        view=view
-                    )
-                    
+        # Check if the user has the required roles
+        allowed_role_ids = {1301959367536672838, 1301958607046443018, 1301958999092236389}
+        user_roles = {role.id for role in interaction.user.roles}
+
+        if not user_roles.intersection(allowed_role_ids):
+            await interaction.response.send_message("You do not have permission to vote.", ephemeral=True)
+            return
+
+        # Check if the user has already voted for any option
+        if interaction.user.id in self.user_votes:
+            await interaction.response.send_message("You have already voted on this prediction!", ephemeral=True)
+            return
+
+        # Mark the user as having voted
+        self.user_votes.add(interaction.user.id)
+
+        # Allow the user to vote for this option
+        self.votes.add(interaction.user.id)
+        await interaction.response.send_message(f"You have voted for {self.option}.", ephemeral=True)
+
+        # Disable all buttons after voting
+        for child in self.view.children:
+            child.disabled = True
+        
+        # Check if threshold reached (2 votes)
+        if len(self.votes) >= 2:
+            if not self.prediction.resolved:
+                self.prediction.resolve(self.option)
+                
+                # Process payouts and notifications
+                total_payout = self.prediction.get_total_bets()
+                winning_users = self.prediction.bets[self.option].items()
+                
+                for user_id, original_bet in winning_users:
+                    payout = self.prediction.get_user_payout(user_id)
+                    if payout > 0:
+                        payout_amount = int(payout)
+                        await interaction.client.points_manager.add_points(user_id, payout_amount)
+                        profit = payout_amount - original_bet
+                        
+                        try:
+                            user = await interaction.client.fetch_user(user_id)
+                            await user.send(
+                                f"🎉 You won {profit:,} Points on '{self.prediction.question}'!\n"
+                                f"Bet: {original_bet:,} → Payout: {payout_amount:,}"
+                            )
+                        except Exception as e:
+                            print(f"Error sending winning notification to user {user_id}: {e}")
+        
+            # Send a message announcing the winning option
+            await interaction.channel.send(
+                f"Market resolved! The winning option is: {self.option}"
+            )
+        
+        # Update the message to show resolution
+        view = self.view
+        for child in view.children:
+            if child.custom_id == f"resolve_{self.option}":
+                child.style = discord.ButtonStyle.success
             else:
-                # Update button label to show vote count
-                self.label = f"{self.option} ({len(self.votes)}/3)"
-                await interaction.message.edit(view=self.view)
-        else:
-            await interaction.response.send_message("You have already voted!", ephemeral=True)
+                child.style = discord.ButtonStyle.danger
+        
+        await interaction.message.edit(
+            content=f"Voting has ended for this market.",
+            view=view
+        )
 
 class ResolutionView(discord.ui.View):
     def __init__(self, prediction: Prediction):

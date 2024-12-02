@@ -611,6 +611,7 @@ class Economy(commands.Cog):
             inactive_markets = []
             resolved_markets = []
             refunded_markets = []
+            pending_resolution_markets = []  # New list for pending resolution
 
             for prediction in self.predictions:
                 prices = prediction.get_current_prices(100)
@@ -626,10 +627,25 @@ class Economy(commands.Cog):
                 else:
                     active_markets.append(combined_data)
 
+                # Check for pending resolution
+                if prediction.end_time <= datetime.datetime.utcnow() and not prediction.resolved:
+                    pending_resolution_markets.append(combined_data)  # Add to pending resolution
+
             # Add markets to embed using the same create_market_display method
             if active_markets:
                 current_embed.add_field(name="🟢 Active Markets", value="\u200b", inline=False)
                 for question, prediction, prices, creator_id in active_markets:
+                    creator_name = (await self.bot.fetch_user(creator_id)).name
+                    current_embed.add_field(
+                        name=f"📊 {question} (Created by: {creator_name})",
+                        value=view.create_market_display(prediction, prices),
+                        inline=False
+                    )
+
+            # Add pending resolution markets
+            if pending_resolution_markets:
+                current_embed.add_field(name="🟡 Pending Resolution", value="\u200b", inline=False)
+                for question, prediction, prices, creator_id in pending_resolution_markets:
                     creator_name = (await self.bot.fetch_user(creator_id)).name
                     current_embed.add_field(
                         name=f"📊 {question} (Created by: {creator_name})",
@@ -656,7 +672,7 @@ class Economy(commands.Cog):
     @app_commands.command(name="resolve_prediction", description="Vote to resolve a prediction")
     async def resolve_prediction_command(self, interaction: discord.Interaction):
         # Check if the user has the required roles
-        allowed_role_ids = {1301959367536672838}
+        allowed_role_ids = {1301959367536672838, 1301958607046443018}
         user_roles = {role.id for role in interaction.user.roles}
 
         if not user_roles.intersection(allowed_role_ids):
@@ -815,6 +831,7 @@ class ListPredictionsView(discord.ui.View):
             inactive_markets = []
             resolved_markets = []
             refunded_markets = []
+            pending_resolution_markets = []  # New list for pending resolution
 
             # Process each prediction
             for prediction in self.cog.predictions:
@@ -831,6 +848,10 @@ class ListPredictionsView(discord.ui.View):
                 else:
                     active_markets.append(combined_data)
 
+                # Check for pending resolution
+                if prediction.end_time <= datetime.datetime.utcnow() and not prediction.resolved:
+                    pending_resolution_markets.append(combined_data)  # Add to pending resolution
+
             # Add markets to embed
             if active_markets:
                 current_embed.add_field(name="🟢 Active Markets", value="\u200b", inline=False)
@@ -842,9 +863,10 @@ class ListPredictionsView(discord.ui.View):
                         inline=False
                     )
 
-            if inactive_markets:
+            # Add pending resolution markets
+            if pending_resolution_markets:
                 current_embed.add_field(name="🟡 Pending Resolution", value="\u200b", inline=False)
-                for question, prediction, prices, creator_id in inactive_markets:
+                for question, prediction, prices, creator_id in pending_resolution_markets:
                     creator_name = (await self.bot.fetch_user(creator_id)).name
                     current_embed.add_field(
                         name=f"📊 {question} (Created by: {creator_name})",
@@ -892,12 +914,20 @@ class ResolutionButton(discord.ui.Button):
         self.votes = set()  # Store user IDs who voted for this option
         
     async def callback(self, interaction: discord.Interaction):
+        # Check if the user has the required roles
+        allowed_role_ids = {1301959367536672838, 1301958607046443018}
+        user_roles = {role.id for role in interaction.user.roles}
+
+        if not user_roles.intersection(allowed_role_ids):
+            await interaction.response.send_message("You do not have permission to vote.", ephemeral=True)
+            return
+
         if interaction.user.id not in self.votes:
             self.votes.add(interaction.user.id)
             await interaction.response.send_message(f"You voted for {self.option}", ephemeral=True)
             
-            # Check if threshold reached (3 votes)
-            if len(self.votes) >= 3:
+            # Check if threshold reached (2 votes)
+            if len(self.votes) >= 2:
                 if not self.prediction.resolved:
                     self.prediction.resolve(self.option)
                     
