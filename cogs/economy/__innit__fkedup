@@ -155,7 +155,6 @@ class Prediction:
         self.resolved = True
         self.result = winning_option
 
-        # Get winning users and their bets
         winning_users = self.bets[self.result].items()  # Get users who bet on the winning option
         print(f"Winning option: {self.result}")  # Debugging output
         print(f"Winning users: {list(winning_users)}")  # Debugging output
@@ -164,57 +163,41 @@ class Prediction:
             print("No winning users found.")  # Debugging output
             return  # Exit if there are no winners
 
-        # Calculate the total pool and winning bets
-        total_pool = sum(sum(user_bets['amount'] for user_bets in option_bets.values()) for option_bets in self.bets.values())
-        total_winning_bets = sum(user_bet_info['amount'] for user_bet_info in self.bets[self.result].values())
+        for user_id, original_bet in winning_users:
+            print(f"Calculating payout for User ID: {user_id}, Original Bet: {original_bet}")  # Debugging output
+            payout = self.get_user_payout(user_id)  # Calculate the payout for the user
+            
+            # Debugging output for payout calculation
+            print(f"User ID: {user_id}, Calculated Payout: {payout}")  # Debugging output
 
-        # Debugging output for total pool and winning bets
-        print(f"Total Pool: {total_pool}, Total Winning Bets: {total_winning_bets}")  # Debugging output
+            if payout > 0:
+                payout_amount = int(payout)
+                print(f"Attempting to add {payout_amount} points to user {user_id}.")  # Debugging output
+                
+                # Ensure the bot instance is initialized
+                if not self.cog.bot:
+                    print("Bot instance is not initialized.")
+                    continue  # Skip this user if the bot instance is not available
 
-        if total_winning_bets <= 0:
-            print("No valid winning bets to distribute points.")  # Debugging output
-            return  # Exit if there are no valid winning bets
-
-        # Notify winners and calculate payouts
-        for user_id, user_bet_info in winning_users:
-            print(f"Calculating payout for User ID: {user_id}, Bet Amount: {user_bet_info['amount']}")  # Debugging output
-
-            # Calculate payout proportionally based on their bet
-            payout = (user_bet_info['amount'] / total_winning_bets) * total_pool
-            payout = int(payout)  # Ensure the payout is an integer
-
-            # Add the payout to the user's points balance
-            try:
-                success = await self.cog.points_manager.add_points(user_id, payout)
-                if success:
-                    user = await self.cog.bot.fetch_user(user_id)
-                    await user.send(
-                        f"🎉 You won {payout:,} Points on '{self.question}'!\n"
-                        f"Your Bet: {user_bet_info['amount']:,} → Payout: {payout:,}"
-                    )
-                else:
-                    print(f"Failed to add points for User ID: {user_id}.")
-            except Exception as e:
-                print(f"Error processing payout for User ID: {user_id}: {e}")
-
-        # Notify losers
-        for option in self.options:
-            if option != self.result:  # Notify only those who lost
-                losing_users = self.bets[option].items()  # Get users who bet on the losing option
-                for user_id, user_bet_info in losing_users:
-                    amount = user_bet_info['amount']  # Access the amount correctly
-                    print(f"Notifying user {user_id} about loss of {amount} points.")  # Debugging output
+                # Retry logic for adding points
+                max_retries = 3
+                for attempt in range(max_retries):
                     try:
-                        user = await self.cog.bot.fetch_user(user_id)
-                        if user:  # Check if the user is valid
+                        success = await self.cog.points_manager.add_points(user_id, payout_amount)
+                        if success:
+                            # Notify the user of their win
+                            user = await self.cog.bot.fetch_user(user_id)  # Ensure you use the correct bot instance
                             await user.send(
-                                f"💔 You lost your bet of {amount:,} Points on '{self.question}'.\n"
-                                f"The winning option was: '{self.result}'."
+                                f"��� You won {payout_amount:,} Points on '{self.question}'!\n"
+                                f"Bet: {original_bet:,} → Payout: {payout_amount:,}"
                             )
+                            break  # Exit the retry loop if successful
                         else:
-                            print(f"User ID {user_id} not found.")
+                            print(f"Failed to add points to user {user_id} on attempt {attempt + 1}.")  # Debugging output
                     except Exception as e:
-                        print(f"Error sending losing notification to user {user_id}: {e}")
+                        print(f"Error adding points to user {user_id} on attempt {attempt + 1}: {e}")
+                        if attempt == max_retries - 1:
+                            print(f"Giving up on adding points to user {user_id} after {max_retries} attempts.")
 
     def get_total_bets(self):
         return self.total_bets
@@ -459,99 +442,67 @@ class ResolutionButton(discord.ui.Button):
         self.option = option
         self.prediction = prediction
         self.votes = set()  # Store user IDs who voted for this option
+        self.update_task = None  # Task for updating the embed
 
     async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id not in self.votes:
-            self.votes.add(interaction.user.id)
-            await interaction.response.send_message(f"You voted for {self.option}", ephemeral=True)
+        # Check if the user has the required roles
+        allowed_role_ids = {1301959367536672838, 1301958607046443018}
+        user_roles = {role.id for role in interaction.user.roles}
 
-            # Check if threshold reached (3 votes)
-            if len(self.votes) >= 3:
-                if not self.prediction.resolved:
-                    await self.prediction.async_resolve(self.option)  # Use async_resolve
+        if not user_roles.intersection(allowed_role_ids):
+            await interaction.response.send_message("You do not have permission to vote.", ephemeral=True)
+            return
 
-                    # Update the message to show resolution
-                    view = self.view
-                    for child in view.children:
-                        child.disabled = True
-                        if child.custom_id == f"resolve_{self.option}":
-                            child.style = discord.ButtonStyle.success
-                        else:
-                            child.style = discord.ButtonStyle.danger
+        # Check if the user has already voted for this prediction
+        if self.prediction.has_voted(interaction.user.id):
+            await interaction.response.send_message("You have already voted on this prediction!", ephemeral=True)
+            return
 
-                    await interaction.message.edit(
-                        content=f"Market resolved! Winning option: {self.option}",
-                        view=view
-                    )
-            else:
-                # Update button label to show vote count
-                self.label = f"{self.option} ({len(self.votes)}/3)"
-                await interaction.message.edit(view=self.view)
+        # Mark the user as having voted
+        self.prediction.vote(interaction.user.id, self.option)
+        self.votes.add(interaction.user.id)
+        await interaction.response.send_message(f"You have voted for {self.option}.", ephemeral=True)
 
-            # Refresh the voting view to show updated vote counts
-            await self.view.refresh_view()  # Call refresh_view to update the embed
-        else:
-            await interaction.response.send_message("You have already voted!", ephemeral=True)
+        # Disable all buttons after voting
+        for child in self.view.children:
+            child.disabled = True
 
-class ResolutionView(discord.ui.View):
-    def __init__(self, prediction: Prediction):
-        super().__init__(timeout=None)
-        self.prediction = prediction
-        self.update_task = None  # Initialize the update task
-        self.start_auto_update()  # Start the auto-update task
+        # Check if threshold reached (2 votes)
+        if len(self.votes) >= 2:  # Adjust threshold as needed
+            if not self.prediction.resolved:
+                await self.prediction.async_resolve(self.option)  # Use async_resolve exclusively
 
-        for option in prediction.options:
-            self.add_item(ResolutionButton(option, prediction))
-
-    def start_auto_update(self):
-        """Start the auto-update task"""
+        # Start the auto-update task if not already running
         if not self.update_task:
-            self.update_task = asyncio.create_task(self.auto_update_votes())
+            self.update_task = asyncio.create_task(self.auto_update_embed(interaction))
+
+    async def auto_update_embed(self, interaction: discord.Interaction):
+        """Auto-update the embed with current vote counts every 5 seconds."""
+        try:
+            while True:
+                embed = discord.Embed(
+                    title=f"Vote to Resolve: {self.prediction.question}",
+                    description="Please vote for the winning option:",
+                    color=discord.Color.blue()
+                )
+
+                for option in self.prediction.options:
+                    embed.add_field(name=option, value=f"Votes: {len(self.prediction.votes[option])}", inline=False)
+
+                # Update the message with the new embed
+                await interaction.message.edit(embed=embed, view=self.view)
+                await asyncio.sleep(5)  # Wait for 5 seconds before the next update
+        except asyncio.CancelledError:
+            # Handle task cancellation
+            pass
+        except Exception as e:
+            print(f"Error in auto_update_embed: {e}")
 
     def stop_auto_update(self):
-        """Stop the auto-update task"""
+        """Stop the auto-update task if it's running."""
         if self.update_task:
             self.update_task.cancel()
             self.update_task = None
-
-    async def auto_update_votes(self):
-        """Auto-update the voting embed every 5 seconds"""
-        try:
-            while True:
-                await self.refresh_view()
-                await asyncio.sleep(5)  # Wait 5 seconds before the next update
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            print(f"Error in auto_update_votes: {e}")
-
-    async def refresh_view(self):
-        """Refresh the view with current vote counts"""
-        if not self.stored_interaction:
-            return
-
-        try:
-            # Create a new embed for the voting status
-            embed = discord.Embed(
-                title=f"Vote to Resolve: {self.prediction.question}",
-                description="Please vote for the winning option:",
-                color=discord.Color.blue()
-            )
-
-            # Add fields for each option with the current vote count
-            for option in self.prediction.options:
-                vote_count = len(self.prediction.bets[option])  # Get the number of votes for the option
-                embed.add_field(name=option, value=f"Votes: {vote_count}", inline=False)
-
-            # Update the interaction with the new embed
-            await self.stored_interaction.edit(embed=embed, view=self)
-
-        except discord.NotFound:
-            self.stop_auto_update()
-            print("Interaction not found, stopping updates.")
-        except Exception as e:
-            print(f"Error refreshing view: {e}")
-            self.stop_auto_update()
 
 class Economy(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -663,19 +614,19 @@ class Economy(commands.Cog):
                 await creator.send(
                     f"🎲 Betting has ended for your prediction: '{prediction.question}'\n"
                     f"Please use `/resolve_prediction` to resolve the market.\n"
-                    f"If not resolved within 5 days, all bets will be automatically refunded."
+                    f"If not resolved within 48 hours, all bets will be automatically refunded."
                 )
                 print(f"DEBUG: Sent notification to creator {prediction.creator_id}")
             except Exception as e:
                 print(f"DEBUG: Error notifying creator: {e}")
 
             # Wait 48 hours
-            print("DEBUG: Starting 120-hour wait")
-            await asyncio.sleep(120 * 3600)  # 120 hours in seconds
+            print("DEBUG: Starting 48-hour wait")
+            await asyncio.sleep(48 * 3600)  # 48 hours in seconds
             
             # Check if resolved during wait
             if prediction.resolved:
-                print("DEBUG: Prediction resolved during 5-day wait")
+                print("DEBUG: Prediction resolved during 48-hour wait")
                 return
                 
             print("DEBUG: Starting auto-refund process")
@@ -955,7 +906,7 @@ class Economy(commands.Cog):
                         await interaction.response.send_message(f"You voted for {option}.", ephemeral=True)
 
                         # Check if the threshold is met
-                        if len(selected_prediction.votes[option]) >= 3:  # Adjust threshold as needed
+                        if len(selected_prediction.votes[option]) >= 2:  # Adjust threshold as needed
                             await selected_prediction.async_resolve(option)
                             await interaction.channel.send(f"Market resolved! The winning option is: {option}")
                             await interaction.message.edit(embed=embed, view=None)  # Disable buttons after resolution
@@ -1114,7 +1065,7 @@ class ListPredictionsView(discord.ui.View):
                 for question, prediction, prices, creator_id in pending_resolution_markets:
                     creator_name = (await self.cog.bot.fetch_user(creator_id)).name
                     current_embed.add_field(
-                        name=f"��� {question} (Created by: {creator_name})",
+                        name=f"📊 {question} (Created by: {creator_name})",
                         value=self.create_market_display(prediction, prices),
                         inline=False
                     )

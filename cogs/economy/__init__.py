@@ -12,21 +12,28 @@ def is_admin():
     return app_commands.check(predicate)
 
 class Prediction:
-    def __init__(self, question, end_time, options, creator_id, category=None):
+    def __init__(self, question, end_time, options, creator_id, cog, category=None):
         self.question = question
         self.end_time = end_time
         self.options = options
         self.creator_id = creator_id
+        self.cog = cog
         self.category = category
-        self.bets = {option: {} for option in options}
+        self.bets = {option: {} for option in options}  # Initialize bets for each option
         self.resolved = False
         self.result = None
         self.refunded = False
         self.total_bets = 0
+        self.user_votes = set()  # Track users who have voted on this prediction
+        self.votes = {option: set() for option in options}  # Track votes for each option
         # Increase initial liquidity significantly to reduce price impact
         self.initial_liquidity = 30000  # Increased from 100
         self.liquidity_pool = {option: self.initial_liquidity for option in options}
         self.k_constant = self.initial_liquidity * self.initial_liquidity  # Adjusted constant product
+
+        # Verify initialization of self.cog and self.cog.bot
+        assert self.cog is not None, "Cog instance is not initialized."
+        assert self.cog.bot is not None, "Bot instance is not initialized."
 
     def get_price(self, option, shares_to_buy):
         """Calculate price for buying shares using constant product formula"""
@@ -49,28 +56,35 @@ class Prediction:
         """Get the opposite option in a binary market"""
         return [opt for opt in self.options if opt != option][0]
 
-    def place_bet(self, user_id, option, points):
+    async def place_bet(self, user_id, option, amount):
         """Place a bet using AMM pricing"""
         if option not in self.liquidity_pool:
             return False
 
-        # Calculate shares user can buy with their points
-        shares = self.calculate_shares_for_points(option, points)
+        # Calculate shares based on the amount
+        shares = self.calculate_shares_for_points(option, amount)
         if shares <= 0:
             return False
 
         # Update liquidity pool
         self.liquidity_pool[option] -= shares
         opposite_option = self.get_opposite_option(option)
-        self.liquidity_pool[opposite_option] += points
+        self.liquidity_pool[opposite_option] += amount
 
-        # Record user's bet amount (not shares) for payout calculation
-        if user_id in self.bets[option]:
-            self.bets[option][user_id] += points
-        else:
-            self.bets[option][user_id] = points
+        # Update the bets dictionary
+        if option not in self.bets:
+            self.bets[option] = {}
+        
+        if user_id not in self.bets[option]:
+            self.bets[option][user_id] = {'amount': 0, 'shares': 0}
+        
+        self.bets[option][user_id]['amount'] += amount
+        self.bets[option][user_id]['shares'] += shares
 
-        self.total_bets += points
+        self.total_bets += amount
+        
+        # Deduct points from user's balance using remove_points
+        await self.cog.points_manager.remove_points(user_id, amount)  # Use remove_points to deduct
         return True
 
     def calculate_shares_for_points(self, option, points):
@@ -87,7 +101,7 @@ class Prediction:
     def get_odds(self):
         """Calculate odds based on total bets"""
         total_bets_per_option = {
-            option: sum(self.bets[option].values())
+            option: sum(user_bets['amount'] for user_bets in self.bets[option].values())
             for option in self.options
         }
         total_all_bets = sum(total_bets_per_option.values())
@@ -105,33 +119,114 @@ class Prediction:
         if not self.resolved or self.result is None:
             return 0
         
-        shares = self.bets[self.result].get(user_id, 0)
-        if shares == 0:
+        # Get the user's shares and amount from the bets
+        user_bet_info = self.bets[self.result].get(user_id, None)
+        if user_bet_info is None:
+            print(f"User ID: {user_id} has no shares in the winning option.")  # Debugging output
             return 0
-            
-        # Calculate payout based on final pool state
-        total_pool = sum(sum(user_bets.values()) for user_bets in self.bets.values())
-        share_value = total_pool / sum(self.bets[self.result].values())
-        return int(shares * share_value)
 
-    def resolve(self, result):
-        if result in self.options and not self.resolved:
-            self.resolved = True
-            self.result = result
-            return True
-        return False
+        shares = user_bet_info['shares']
+        if shares == 0:
+            print(f"User ID: {user_id} has no shares in the winning option.")  # Debugging output
+            return 0
+
+        # Calculate total pool and total winning bets
+        total_pool = sum(sum(user_bets['amount'] for user_bets in option_bets.values()) for option_bets in self.bets.values())
+        total_winning_bets = sum(user_bet_info['amount'] for user_bet_info in self.bets[self.result].values())
+        
+        # Debugging output for total pool and winning bets
+        print(f"Total Pool: {total_pool}, Total Winning Bets: {total_winning_bets}, User Shares: {shares}")  # Debugging output
+
+        # Check if total_winning_bets is zero to avoid division by zero
+        if total_winning_bets <= 0:
+            print(f"No winning bets found for User ID: {user_id}. Total Winning Bets is zero.")  # Debugging output
+            return 0
+
+        share_value = total_pool / total_winning_bets
+        payout = int(shares * share_value)
+        
+        # Debugging output for final payout calculation
+        print(f"User ID: {user_id}, Shares: {shares}, Share Value: {share_value}, Payout: {payout}")  # Debugging output
+        
+        return payout
+
+    async def async_resolve(self, winning_option):
+        """Asynchronous method to handle resolution logic."""
+        self.resolved = True
+        self.result = winning_option
+
+        # Get winning users and their bets
+        winning_users = self.bets[self.result].items()  # Get users who bet on the winning option
+        print(f"Winning option: {self.result}")  # Debugging output
+        print(f"Winning users: {list(winning_users)}")  # Debugging output
+
+        if not winning_users:
+            print("No winning users found.")  # Debugging output
+            return  # Exit if there are no winners
+
+        # Calculate the total pool and winning bets
+        total_pool = sum(sum(user_bets['amount'] for user_bets in option_bets.values()) for option_bets in self.bets.values())
+        total_winning_bets = sum(user_bet_info['amount'] for user_bet_info in self.bets[self.result].values())
+
+        # Debugging output for total pool and winning bets
+        print(f"Total Pool: {total_pool}, Total Winning Bets: {total_winning_bets}")  # Debugging output
+
+        if total_winning_bets <= 0:
+            print("No valid winning bets to distribute points.")  # Debugging output
+            return  # Exit if there are no valid winning bets
+
+        # Notify winners and calculate payouts
+        for user_id, user_bet_info in winning_users:
+            print(f"Calculating payout for User ID: {user_id}, Bet Amount: {user_bet_info['amount']}")  # Debugging output
+
+            # Calculate payout proportionally based on their bet
+            payout = (user_bet_info['amount'] / total_winning_bets) * total_pool
+            payout = int(payout)  # Ensure the payout is an integer
+
+            # Add the payout to the user's points balance
+            try:
+                success = await self.cog.points_manager.add_points(user_id, payout)
+                if success:
+                    user = await self.cog.bot.fetch_user(user_id)
+                    await user.send(
+                        f"🎉 You won {payout:,} Points on '{self.question}'!\n"
+                        f"Your Bet: {user_bet_info['amount']:,} → Payout: {payout:,}"
+                    )
+                else:
+                    print(f"Failed to add points for User ID: {user_id}.")
+            except Exception as e:
+                print(f"Error processing payout for User ID: {user_id}: {e}")
+
+        # Notify losers
+        for option in self.options:
+            if option != self.result:  # Notify only those who lost
+                losing_users = self.bets[option].items()  # Get users who bet on the losing option
+                for user_id, user_bet_info in losing_users:
+                    amount = user_bet_info['amount']  # Access the amount correctly
+                    print(f"Notifying user {user_id} about loss of {amount} points.")  # Debugging output
+                    try:
+                        user = await self.cog.bot.fetch_user(user_id)
+                        if user:  # Check if the user is valid
+                            await user.send(
+                                f"💔 You lost your bet of {amount:,} Points on '{self.question}'.\n"
+                                f"The winning option was: '{self.result}'."
+                            )
+                        else:
+                            print(f"User ID {user_id} not found.")
+                    except Exception as e:
+                        print(f"Error sending losing notification to user {user_id}: {e}")
 
     def get_total_bets(self):
         return self.total_bets
 
     def get_option_total_bets(self, option):
-        return sum(self.bets[option].values()) if option in self.bets else 0
+        return sum(user_bets['amount'] for user_bets in self.bets[option].values()) if option in self.bets else 0
 
     def get_bet_history(self):
         history = []
         for option, bets in self.bets.items():
-            for user_id, amount in bets.items():
-                history.append((user_id, option, amount))
+            for user_id, user_bet_info in bets.items():
+                history.append((user_id, option, user_bet_info['amount']))
         return history
 
     def mark_as_refunded(self):
@@ -143,7 +238,7 @@ class Prediction:
         prices = {}
         
         # Calculate total bets for probability calculation
-        total_bets = sum(sum(self.bets[option].values()) for option in self.options)
+        total_bets = sum(sum(user_bets['amount'] for user_bets in self.bets[option].values()) for option in self.options)
         if total_bets == 0:
             # If no bets yet, use equal probabilities
             base_probability = 100 / len(self.options)
@@ -151,7 +246,7 @@ class Prediction:
         else:
             # Calculate probabilities based on total bets per option
             probabilities = {
-                option: (sum(self.bets[option].values()) / total_bets * 100)
+                option: (sum(user_bets['amount'] for user_bets in self.bets[option].values()) / total_bets * 100)
                 for option in self.options
             }
         
@@ -167,9 +262,20 @@ class Prediction:
                 'potential_shares': shares,
                 'potential_payout': points_to_spend if shares > 0 else 0,
                 'probability': probabilities[option],  # Now based on total bets
-                'total_bets': sum(self.bets[option].values())
+                'total_bets': sum(user_bets['amount'] for user_bets in self.bets[option].values())
             }
         return prices
+
+    def has_voted(self, user_id):
+        return user_id in self.user_votes
+
+    def vote(self, user_id, option):
+        if option in self.votes:
+            self.votes[option].add(user_id)
+            self.user_votes.add(user_id)
+
+    def is_resolved(self):
+        return self.resolved
 
 class OptionButton(discord.ui.Button):
     def __init__(self, label, prediction, cog, view):
@@ -233,7 +339,7 @@ class AmountInput(discord.ui.Modal, title="Place Your Bet"):
 
             # Transfer points and place bet
             await self.cog.points_manager.transfer_points(interaction.user.id, self.cog.bot.user.id, amount)
-            if await self.cog.place_bet(interaction.user.id, self.prediction, self.option, amount):
+            if await self.prediction.place_bet(interaction.user.id, self.option, amount):
                 await interaction.response.send_message(
                     f"Bet placed successfully!\n"
                     f"Amount: {amount:,} Points\n"
@@ -343,6 +449,112 @@ class OptionButtonView(discord.ui.View):
         self.stop_auto_update()
         self.cog.active_views.discard(self)
 
+
+
+class ResolutionButton(discord.ui.Button):
+    def __init__(self, option: str, prediction: Prediction, view: 'ResolutionView'):
+        super().__init__(
+            label=option,
+            style=discord.ButtonStyle.primary,
+            custom_id=f"resolve_{option}"
+        )
+        self.option = option
+        self.prediction = prediction
+        self.view = view  # Reference to the ResolutionView
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id not in self.view.votes[self.option]:
+            self.view.votes[self.option].add(interaction.user.id)  # Track votes in the view
+            await interaction.response.send_message(f"You voted for {self.option}", ephemeral=True)
+
+            # Update the button label to show the current vote count
+            self.label = f"{self.option} ({len(self.view.votes[self.option])})"
+            await interaction.message.edit(view=self.view)
+
+            # Check if threshold reached (3 votes)
+            if len(self.view.votes[self.option]) >= 3:
+                if not self.prediction.resolved:
+                    await self.prediction.async_resolve(self.option)  # Use async_resolve
+
+                    # Update the message to show resolution
+                    for child in self.view.children:
+                        child.disabled = True
+                        if child.custom_id == f"resolve_{self.option}":
+                            child.style = discord.ButtonStyle.success
+                        else:
+                            child.style = discord.ButtonStyle.danger
+
+                    await interaction.message.edit(
+                        content=f"Market resolved! Winning option: {self.option}",
+                        view=self.view
+                    )
+        else:
+            await interaction.response.send_message("You have already voted!", ephemeral=True)
+
+class ResolutionView(discord.ui.View):
+    def __init__(self, prediction: Prediction):
+        super().__init__(timeout=None)
+        self.prediction = prediction
+        self.stored_interaction = None
+        self.update_task = None
+        self.votes = {option: set() for option in prediction.options}  # Track votes for each option
+
+        self.start_auto_update()  # Start the auto-update task
+
+        # Add buttons for each option
+        for option in prediction.options:
+            self.add_item(ResolutionButton(option, prediction, self))
+
+    def start_auto_update(self):
+        """Start the auto-update task"""
+        if not self.update_task:
+            self.update_task = asyncio.create_task(self.auto_update_votes())
+
+    def stop_auto_update(self):
+        """Stop the auto-update task"""
+        if self.update_task:
+            self.update_task.cancel()
+            self.update_task = None
+
+    async def auto_update_votes(self):
+        """Auto-update the voting embed every 5 seconds"""
+        try:
+            while True:
+                await self.refresh_view()
+                await asyncio.sleep(5)  # Wait 5 seconds before next update
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"Error in auto_update_votes: {e}")
+
+    async def refresh_view(self):
+        """Refresh the view with current vote counts"""
+        if not self.stored_interaction:
+            return
+
+        try:
+            # Create a new embed for the voting status
+            embed = discord.Embed(
+                title=f"Vote to Resolve: {self.prediction.question}",
+                description="Please vote for the winning option:",
+                color=discord.Color.blue()
+            )
+
+            # Add fields for each option with the current vote count
+            for option in self.prediction.options:
+                vote_count = len(self.votes[option])  # Get the number of votes for the option
+                embed.add_field(name=option, value=f"Votes: {vote_count}", inline=False)
+
+            # Update the interaction with the new embed
+            await self.stored_interaction.edit(embed=embed, view=self)
+
+        except discord.NotFound:
+            self.stop_auto_update()
+            print("Interaction not found, stopping updates.")
+        except Exception as e:
+            print(f"Error refreshing view: {e}")
+            self.stop_auto_update()
+
 class Economy(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -396,7 +608,7 @@ class Economy(commands.Cog):
             
             # Create prediction object
             end_time = datetime.datetime.utcnow() + datetime.timedelta(minutes=total_minutes)
-            new_prediction = Prediction(question, end_time, options_list, interaction.user.id, category)
+            new_prediction = Prediction(question, end_time, options_list, interaction.user.id, self, category)
             
             # Add to predictions list
             self.predictions.append(new_prediction)
@@ -453,19 +665,19 @@ class Economy(commands.Cog):
                 await creator.send(
                     f"🎲 Betting has ended for your prediction: '{prediction.question}'\n"
                     f"Please use `/resolve_prediction` to resolve the market.\n"
-                    f"If not resolved within 48 hours, all bets will be automatically refunded."
+                    f"If not resolved within 5 days, all bets will be automatically refunded."
                 )
                 print(f"DEBUG: Sent notification to creator {prediction.creator_id}")
             except Exception as e:
                 print(f"DEBUG: Error notifying creator: {e}")
 
             # Wait 48 hours
-            print("DEBUG: Starting 48-hour wait")
-            await asyncio.sleep(48 * 3600)  # 48 hours in seconds
+            print("DEBUG: Starting 120-hour wait")
+            await asyncio.sleep(120 * 3600)  # 120 hours in seconds
             
             # Check if resolved during wait
             if prediction.resolved:
-                print("DEBUG: Prediction resolved during 48-hour wait")
+                print("DEBUG: Prediction resolved during 5-day wait")
                 return
                 
             print("DEBUG: Starting auto-refund process")
@@ -475,12 +687,12 @@ class Economy(commands.Cog):
             
             # Return all bets to users
             for option in prediction.bets:
-                for user_id, amount in prediction.bets[option].items():
-                    await self.points_manager.add_points(user_id, amount)
+                for user_id, user_bet_info in prediction.bets[option].items():
+                    await self.points_manager.add_points(user_id, user_bet_info['amount'])
                     try:
                         user = await self.bot.fetch_user(user_id)
                         await user.send(
-                            f"💰 Your bet of {amount:,} Points has been refunded for the expired market:\n"
+                            f"💰 Your bet of {user_bet_info['amount']:,} Points has been refunded for the expired market:\n"
                             f"'{prediction.question}'"
                         )
                     except Exception as e:
@@ -633,7 +845,7 @@ class Economy(commands.Cog):
 
             # Add markets to embed using the same create_market_display method
             if active_markets:
-                current_embed.add_field(name="🟢 Active Markets", value="\u200b", inline=False)
+                current_embed.add_field(name=" Active Markets", value="\u200b", inline=False)
                 for question, prediction, prices, creator_id in active_markets:
                     creator_name = (await self.bot.fetch_user(creator_id)).name
                     current_embed.add_field(
@@ -716,13 +928,46 @@ class Economy(commands.Cog):
                 selected_index = int(self.values[0])
                 selected_prediction = unresolved_predictions[selected_index]
                 
-                view = ResolutionView(selected_prediction)
-                await interaction.response.send_message(
-                    f"Vote for the winning option for:\n**{selected_prediction.question}**\n"
-                    f"(Requires 2 votes to resolve)",
-                    view=view,
-                    ephemeral=False  # Make voting public
+                # Check if the user has already voted on this prediction
+                if selected_prediction.has_voted(interaction.user.id):
+                    await interaction.response.send_message("You have already voted on this prediction!", ephemeral=True)
+                    return
+
+                # Create an embed for voting
+                embed = discord.Embed(
+                    title=f"Vote to Resolve: {selected_prediction.question}",
+                    description="Please vote for the winning option:",
+                    color=discord.Color.blue()
                 )
+
+                for option in selected_prediction.options:
+                    embed.add_field(name=option, value=f"Votes: {len(selected_prediction.votes[option])}", inline=False)
+
+                view = discord.ui.View()
+
+                for option in selected_prediction.options:
+                    button = discord.ui.Button(label=option, style=discord.ButtonStyle.primary)
+
+                    async def button_callback(interaction: discord.Interaction, option=option):
+                        if selected_prediction.has_voted(interaction.user.id):
+                            await interaction.response.send_message("You have already voted on this prediction!", ephemeral=True)
+                            return
+
+                        selected_prediction.vote(interaction.user.id, option)
+                        await interaction.response.send_message(f"You voted for {option}.", ephemeral=True)
+
+                        # Check if the threshold is met
+                        if len(selected_prediction.votes[option]) >= 3:  # Adjust threshold as needed
+                            await selected_prediction.async_resolve(option)
+                            await interaction.channel.send(f"Market resolved! The winning option is: {option}")
+                            await interaction.message.edit(embed=embed, view=None)  # Disable buttons after resolution
+                        else:
+                            await interaction.message.edit(embed=embed)  # Update embed with new vote count
+
+                    button.callback = button_callback
+                    view.add_item(button)
+
+                await interaction.response.send_message(embed=embed, view=view, ephemeral=False)
 
         view = discord.ui.View()
         view.add_item(PredictionSelect(unresolved_predictions))
@@ -805,12 +1050,14 @@ class ListPredictionsView(discord.ui.View):
 
         for option in prediction.options:
             price_info = prices[option]
+            vote_count = len(prediction.votes[option])  # Get the number of votes for the option
             market_text += (
                 f"```\n"
                 f"{option}\n"
                 f"Price: {price_info['price_per_share']:.2f} Points/Share\n"
                 f"Prob:  {price_info['probability']:.1f}%\n"
                 f"Volume: {price_info['total_bets']:,} Points\n"
+                f"Votes: {vote_count}\n"  # Display the number of votes
                 f"```\n"
             )
 
@@ -856,7 +1103,7 @@ class ListPredictionsView(discord.ui.View):
             if active_markets:
                 current_embed.add_field(name="🟢 Active Markets", value="\u200b", inline=False)
                 for question, prediction, prices, creator_id in active_markets:
-                    creator_name = (await self.bot.fetch_user(creator_id)).name
+                    creator_name = (await self.cog.bot.fetch_user(creator_id)).name
                     current_embed.add_field(
                         name=f"📊 {question} (Created by: {creator_name})",
                         value=self.create_market_display(prediction, prices),
@@ -867,9 +1114,9 @@ class ListPredictionsView(discord.ui.View):
             if pending_resolution_markets:
                 current_embed.add_field(name="🟡 Pending Resolution", value="\u200b", inline=False)
                 for question, prediction, prices, creator_id in pending_resolution_markets:
-                    creator_name = (await self.bot.fetch_user(creator_id)).name
+                    creator_name = (await self.cog.bot.fetch_user(creator_id)).name
                     current_embed.add_field(
-                        name=f"📊 {question} (Created by: {creator_name})",
+                        name=f" {question} (Created by: {creator_name})",
                         value=self.create_market_display(prediction, prices),
                         inline=False
                     )
@@ -902,91 +1149,34 @@ class ListPredictionsView(discord.ui.View):
         self.stop_auto_update()
         self.cog.active_views.discard(self)
 
-class ResolutionButton(discord.ui.Button):
-    def __init__(self, option: str, prediction: Prediction):
-        super().__init__(
-            label=option,
-            style=discord.ButtonStyle.primary,
-            custom_id=f"resolve_{option}"
-        )
-        self.option = option
-        self.prediction = prediction
-        self.votes = set()  # Store user IDs who voted for this option
-        self.user_votes = set()  # Store user IDs who voted for any option in this prediction
+class PointsManagerSingleton:
+    def __init__(self, session, base_url, realm_id):
+        self.session = session
+        self.base_url = base_url
+        self.realm_id = realm_id
+
+    async def add_points(self, user_id: int, amount: int) -> bool:
+        """Add points to a user's balance."""
+        if not self.session:
+            await self.initialize()  # Ensure the session is initialized
         
-    async def callback(self, interaction: discord.Interaction):
-        # Check if the user has the required roles
-        allowed_role_ids = {1301959367536672838, 1301958607046443018, 1301958999092236389}
-        user_roles = {role.id for role in interaction.user.roles}
-
-        if not user_roles.intersection(allowed_role_ids):
-            await interaction.response.send_message("You do not have permission to vote.", ephemeral=True)
-            return
-
-        # Check if the user has already voted for any option
-        if interaction.user.id in self.user_votes:
-            await interaction.response.send_message("You have already voted on this prediction!", ephemeral=True)
-            return
-
-        # Mark the user as having voted
-        self.user_votes.add(interaction.user.id)
-
-        # Allow the user to vote for this option
-        self.votes.add(interaction.user.id)
-        await interaction.response.send_message(f"You have voted for {self.option}.", ephemeral=True)
-
-        # Disable all buttons after voting
-        for child in self.view.children:
-            child.disabled = True
+        headers = await self._get_headers()  # Get necessary headers for the request
         
-        # Check if threshold reached (2 votes)
-        if len(self.votes) >= 2:
-            if not self.prediction.resolved:
-                self.prediction.resolve(self.option)
-                
-                # Process payouts and notifications
-                total_payout = self.prediction.get_total_bets()
-                winning_users = self.prediction.bets[self.option].items()
-                
-                for user_id, original_bet in winning_users:
-                    payout = self.prediction.get_user_payout(user_id)
-                    if payout > 0:
-                        payout_amount = int(payout)
-                        await interaction.client.points_manager.add_points(user_id, payout_amount)
-                        profit = payout_amount - original_bet
-                        
-                        try:
-                            user = await interaction.client.fetch_user(user_id)
-                            await user.send(
-                                f"🎉 You won {profit:,} Points on '{self.prediction.question}'!\n"
-                                f"Bet: {original_bet:,} → Payout: {payout_amount:,}"
-                            )
-                        except Exception as e:
-                            print(f"Error sending winning notification to user {user_id}: {e}")
-        
-            # Send a message announcing the winning option
-            await interaction.channel.send(
-                f"Market resolved! The winning option is: {self.option}"
-            )
-        
-        # Update the message to show resolution
-        view = self.view
-        for child in view.children:
-            if child.custom_id == f"resolve_{self.option}":
-                child.style = discord.ButtonStyle.success
-            else:
-                child.style = discord.ButtonStyle.danger
-        
-        await interaction.message.edit(
-            content=f"Voting has ended for this market.",
-            view=view
-        )
-
-class ResolutionView(discord.ui.View):
-    def __init__(self, prediction: Prediction):
-        super().__init__(timeout=None)
-        for option in prediction.options:
-            self.add_item(ResolutionButton(option, prediction))
+        try:
+            async with self.session.patch(
+                f"{self.base_url}/api/v4/realms/{self.realm_id}/members/{user_id}/tokenBalance",
+                headers=headers,
+                json={"tokens": amount}  # Send the amount to be added
+            ) as response:
+                if response.status == 200:
+                    return True  # Successfully added points
+                else:
+                    response_text = await response.text()
+                    print(f"Failed to add points: {response.status} - {response_text}")  # Log the status code and response text
+                    return False  # Failed to add points
+        except Exception as e:
+            print(f"Error adding points to user {user_id}: {e}")
+            return False  # Return False on error
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(Economy(bot))
