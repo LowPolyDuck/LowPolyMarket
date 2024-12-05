@@ -273,6 +273,8 @@ class Prediction:
         if option in self.votes:
             self.votes[option].add(user_id)
             self.user_votes.add(user_id)
+            # Notify the cog about the prediction update
+            asyncio.create_task(self.cog.update_prediction(self))
 
     def is_resolved(self):
         return self.resolved
@@ -363,7 +365,7 @@ class OptionButtonView(discord.ui.View):
         self.update_task = None
         
         self.cog.active_views.add(self)
-        # Start the auto-update task
+        self.cog.prediction_to_views.setdefault(self.prediction, []).append(self)  # Register the view
         self.start_auto_update()
 
     def update_buttons(self):
@@ -448,8 +450,10 @@ class OptionButtonView(discord.ui.View):
         """Cleanup when the view is destroyed"""
         self.stop_auto_update()
         self.cog.active_views.discard(self)
-
-
+        if self.prediction in self.cog.prediction_to_views:
+            self.cog.prediction_to_views[self.prediction].remove(self)
+            if not self.cog.prediction_to_views[self.prediction]:
+                del self.cog.prediction_to_views[self.prediction]
 
 class ResolutionButton(discord.ui.Button):
     def __init__(self, option: str, prediction: Prediction, view: 'ResolutionView'):
@@ -475,10 +479,21 @@ class ResolutionButton(discord.ui.Button):
             self.label = f"{self.option} ({len(self.view.votes[self.option])})"
             await interaction.message.edit(view=self.view)
 
+            # Record the vote in the Prediction object
+            self.prediction.vote(interaction.user.id, self.option)
+
+            # Notify the Economy cog about the prediction update
+            await self.view.cog.update_prediction(self.prediction)
+
+            # Notify all ListPredictionsView instances to refresh
+            for view in self.view.cog.active_views:
+                if isinstance(view, ListPredictionsView):
+                    await view.refresh_view()
+
             # Check if threshold reached (3 votes)
             if len(self.view.votes[self.option]) >= 3:
                 if not self.prediction.resolved:
-                    await self.prediction.async_resolve(self.option)  # Use async_resolve
+                    await self.prediction.async_resolve(self.option)
 
                     # Update the message to show resolution
                     for child in self.view.children:
@@ -492,13 +507,17 @@ class ResolutionButton(discord.ui.Button):
                         content=f"Market resolved! Winning option: {self.option}",
                         view=self.view
                     )
+
+                    # Notify the Economy cog about the prediction resolution
+                    await self.view.cog.update_prediction(self.prediction)
         else:
             await interaction.response.send_message("You have already voted!", ephemeral=True)
 
 class ResolutionView(discord.ui.View):
-    def __init__(self, prediction: Prediction):
+    def __init__(self, prediction: Prediction, cog: 'Economy'):
         super().__init__(timeout=None)
         self.prediction = prediction
+        self.cog = cog  # Store a reference to the Economy cog
         self.stored_interaction = None
         self.update_task = None
         self.votes = {option: set() for option in prediction.options}  # Track votes for each option
@@ -565,6 +584,7 @@ class Economy(commands.Cog):
         self.points_manager = bot.points_manager
         self.predictions = []
         self.active_views = set()
+        self.prediction_to_views = {}  # New mapping from predictions to views
 
     @app_commands.guild_only()
     @app_commands.command(name="create_prediction", description="Create a new prediction market")
@@ -912,7 +932,8 @@ class Economy(commands.Cog):
 
         # Create selection menu for predictions
         class PredictionSelect(discord.ui.Select):
-            def __init__(self, predictions):
+            def __init__(self, predictions, cog):
+                self.cog = cog  # Store a reference to the Economy cog
                 options = [
                     discord.SelectOption(
                         label=prediction.question[:100],
@@ -932,8 +953,8 @@ class Economy(commands.Cog):
                 selected_index = int(self.values[0])
                 selected_prediction = unresolved_predictions[selected_index]
 
-                # Create the ResolutionView
-                view = ResolutionView(selected_prediction)
+                # Create the ResolutionView with a reference to the cog
+                view = ResolutionView(selected_prediction, self.cog)
                 embed = discord.Embed(
                     title=f"Vote to Resolve: {selected_prediction.question}",
                     description="Please vote for the winning option:",
@@ -945,20 +966,22 @@ class Economy(commands.Cog):
                 view.stored_interaction = await interaction.original_response()
 
         view = discord.ui.View()
-        view.add_item(PredictionSelect(unresolved_predictions))
+        view.add_item(PredictionSelect(unresolved_predictions, self))  # Pass 'self' as the cog
         await interaction.followup.send("Select a prediction to resolve:", view=view, ephemeral=True)
 
     @commands.Cog.listener()
     async def on_prediction_update(self, prediction: Prediction):
         """Event listener for when a prediction is updated"""
-        if prediction in self.active_views:
-            view = self.active_views[prediction]
-            if view.stored_interaction:
-                try:
-                    await view.refresh_view(view.stored_interaction)
-                except:
-                    # If update fails, clean up the view
-                    self.active_views.discard(prediction)
+        if prediction in self.prediction_to_views:
+            views = self.prediction_to_views[prediction]
+            for view in views:
+                if view.stored_interaction:
+                    try:
+                        await view.refresh_view()
+                    except Exception as e:
+                        print(f"Error updating view: {e}")
+                        # If update fails, clean up the view
+                        self.active_views.discard(view)
 
     async def update_prediction(self, prediction: Prediction):
         """Call this method whenever a bet is placed"""
@@ -992,30 +1015,97 @@ class ListPredictionsView(discord.ui.View):
         self.update_task = None
         self.start_auto_update()
 
+        # Register this view for all predictions
+        for prediction in self.cog.predictions:
+            self.cog.prediction_to_views.setdefault(prediction, []).append(self)
+
     def start_auto_update(self):
-        """Start the auto-update task"""
+        """Start the auto-update task."""
         if not self.update_task:
-            self.update_task = asyncio.create_task(self.auto_update_markets())
+            self.update_task = asyncio.create_task(self.auto_update())
 
     def stop_auto_update(self):
-        """Stop the auto-update task"""
+        """Stop the auto-update task."""
         if self.update_task:
             self.update_task.cancel()
             self.update_task = None
 
-    async def auto_update_markets(self):
-        """Auto-update markets every 5 seconds"""
+    async def auto_update(self):
+        """Auto-update the view every 5 seconds."""
         try:
             while True:
                 await self.refresh_view()
-                await asyncio.sleep(5)
+                await asyncio.sleep(5)  # Wait 5 seconds before the next update
         except asyncio.CancelledError:
-            pass
+            pass  # Handle task cancellation
         except Exception as e:
-            print(f"Error in auto_update_markets: {e}")
+            print(f"Error in auto-update: {e}")
+
+    async def refresh_view(self):
+        """Refresh the view with current vote counts."""
+        if not self.stored_interaction:
+            return
+
+        try:
+            current_embed = discord.Embed(
+                title="🎲 Prediction Markets",
+                description="Current prediction markets available for betting.",
+                color=discord.Color.blue()
+            )
+
+            now = datetime.datetime.utcnow()  # Define now once for consistency
+
+            active_markets = []
+            pending_resolution_markets = []  # New list for pending resolution
+
+            # Process each prediction
+            for prediction in self.cog.predictions:
+                prices = prediction.get_current_prices(100)
+                combined_data = (prediction.question, prediction, prices, prediction.creator_id)
+
+                # Check the state of the prediction
+                if prediction.resolved:
+                    continue  # Skip resolved predictions
+                elif now >= prediction.end_time and not prediction.resolved:
+                    pending_resolution_markets.append(combined_data)  # Add to pending resolution
+                elif now < prediction.end_time and not prediction.resolved:
+                    active_markets.append(combined_data)
+
+            # Add active markets to embed
+            if active_markets:
+                current_embed.add_field(name="🟢 Active Markets", value="\u200b", inline=False)
+                for question, prediction, prices, creator_id in active_markets:
+                    creator_name = (await self.cog.bot.fetch_user(creator_id)).name
+                    current_embed.add_field(
+                        name=f"📊 {question} (Created by: {creator_name})",
+                        value=self.create_market_display(prediction, prices),
+                        inline=False
+                    )
+
+            # Add pending resolution markets
+            if pending_resolution_markets:
+                current_embed.add_field(name="🟡 Pending Resolution", value="\u200b", inline=False)
+                for question, prediction, prices, creator_id in pending_resolution_markets:
+                    creator_name = (await self.cog.bot.fetch_user(creator_id)).name
+                    current_embed.add_field(
+                        name=f"📊 {question} (Created by: {creator_name})",
+                        value=self.create_market_display(prediction, prices),
+                        inline=False
+                    )
+
+            await self.stored_interaction.edit(embed=current_embed)
+
+        except discord.NotFound:
+            # Message was deleted
+            self.stop_auto_update()
+            if self in self.cog.active_views:
+                self.cog.active_views.discard(self)
+        except Exception as e:
+            print(f"Error refreshing list view: {e}")
+            self.stop_auto_update()
 
     def create_market_display(self, prediction, prices):
-        """Create a PolyMarket-style display for a prediction"""
+        """Create a display for a prediction."""
         market_text = (
             f"**Category:** {prediction.category or 'None'}\n"
             f"**Total Volume:** {prediction.get_total_bets():,} Points\n"
@@ -1037,92 +1127,6 @@ class ListPredictionsView(discord.ui.View):
             )
 
         return market_text
-
-    async def refresh_view(self):
-        if not self.stored_interaction:
-            return
-
-        try:
-            current_embed = discord.Embed(
-                title="🎲 Prediction Markets",
-                description="Current prediction markets available for betting.",
-                color=discord.Color.blue()
-            )
-
-            active_markets = []
-            inactive_markets = []
-            resolved_markets = []
-            refunded_markets = []
-            pending_resolution_markets = []  # New list for pending resolution
-
-            # Process each prediction
-            for prediction in self.cog.predictions:
-                prices = prediction.get_current_prices(100)
-                combined_data = (prediction.question, prediction, prices, prediction.creator_id)
-
-                if prediction.resolved:
-                    if prediction.refunded:
-                        refunded_markets.append(combined_data)
-                    else:
-                        resolved_markets.append(combined_data)
-                elif prediction.end_time <= datetime.datetime.utcnow():
-                    inactive_markets.append(combined_data)
-                else:
-                    active_markets.append(combined_data)
-
-                # Check for pending resolution
-                if prediction.end_time <= datetime.datetime.utcnow() and not prediction.resolved:
-                    pending_resolution_markets.append(combined_data)  # Add to pending resolution
-
-            # Add markets to embed
-            if active_markets:
-                current_embed.add_field(name="🟢 Active Markets", value="\u200b", inline=False)
-                for question, prediction, prices, creator_id in active_markets:
-                    creator_name = (await self.cog.bot.fetch_user(creator_id)).name
-                    current_embed.add_field(
-                        name=f"📊 {question} (Created by: {creator_name})",
-                        value=self.create_market_display(prediction, prices),
-                        inline=False
-                    )
-
-            # Add pending resolution markets
-            if pending_resolution_markets:
-                current_embed.add_field(name="🟡 Pending Resolution", value="\u200b", inline=False)
-                for question, prediction, prices, creator_id in pending_resolution_markets:
-                    creator_name = (await self.cog.bot.fetch_user(creator_id)).name
-                    current_embed.add_field(
-                        name=f" {question} (Created by: {creator_name})",
-                        value=self.create_market_display(prediction, prices),
-                        inline=False
-                    )
-
-            # Add other market sections as needed...
-
-            current_embed.set_footer(text="Use /bet to place bets on active markets")
-            await self.stored_interaction.edit(embed=current_embed)
-
-        except discord.NotFound:
-            # Message was deleted
-            self.stop_auto_update()
-            if self in self.cog.active_views:
-                self.cog.active_views.discard(self)
-        except discord.HTTPException as e:
-            if e.code == 50027:  # Invalid Webhook Token
-                # Token expired, stop updates
-                print("Interaction token expired, stopping updates")
-                self.stop_auto_update()
-                if self in self.cog.active_views:
-                    self.cog.active_views.discard(self)
-            else:
-                print(f"HTTP Exception in refresh_view: {e}")
-        except Exception as e:
-            print(f"Error refreshing list view: {e}")
-            self.stop_auto_update()
-
-    def __del__(self):
-        """Cleanup when the view is destroyed"""
-        self.stop_auto_update()
-        self.cog.active_views.discard(self)
 
 class PointsManagerSingleton:
     def __init__(self, session, base_url, realm_id):

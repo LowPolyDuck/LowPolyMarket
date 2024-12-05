@@ -449,8 +449,10 @@ class OptionButtonView(discord.ui.View):
         self.stop_auto_update()
         self.cog.active_views.discard(self)
 
+
+
 class ResolutionButton(discord.ui.Button):
-    def __init__(self, option: str, prediction: Prediction):
+    def __init__(self, option: str, prediction: Prediction, view: 'ResolutionView'):
         super().__init__(
             label=option,
             style=discord.ButtonStyle.primary,
@@ -458,21 +460,24 @@ class ResolutionButton(discord.ui.Button):
         )
         self.option = option
         self.prediction = prediction
-        self.votes = set()  # Store user IDs who voted for this option
+        self.view = view  # Reference to the ResolutionView
 
     async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id not in self.votes:
-            self.votes.add(interaction.user.id)
+        if interaction.user.id not in self.view.votes[self.option]:
+            self.view.votes[self.option].add(interaction.user.id)  # Track votes in the view
             await interaction.response.send_message(f"You voted for {self.option}", ephemeral=True)
 
+            # Update the button label to show the current vote count
+            self.label = f"{self.option} ({len(self.view.votes[self.option])})"
+            await interaction.message.edit(view=self.view)
+
             # Check if threshold reached (3 votes)
-            if len(self.votes) >= 3:
+            if len(self.view.votes[self.option]) >= 3:
                 if not self.prediction.resolved:
                     await self.prediction.async_resolve(self.option)  # Use async_resolve
 
                     # Update the message to show resolution
-                    view = self.view
-                    for child in view.children:
+                    for child in self.view.children:
                         child.disabled = True
                         if child.custom_id == f"resolve_{self.option}":
                             child.style = discord.ButtonStyle.success
@@ -481,15 +486,8 @@ class ResolutionButton(discord.ui.Button):
 
                     await interaction.message.edit(
                         content=f"Market resolved! Winning option: {self.option}",
-                        view=view
+                        view=self.view
                     )
-            else:
-                # Update button label to show vote count
-                self.label = f"{self.option} ({len(self.votes)}/3)"
-                await interaction.message.edit(view=self.view)
-
-            # Refresh the voting view to show updated vote counts
-            await self.view.refresh_view()  # Call refresh_view to update the embed
         else:
             await interaction.response.send_message("You have already voted!", ephemeral=True)
 
@@ -497,11 +495,15 @@ class ResolutionView(discord.ui.View):
     def __init__(self, prediction: Prediction):
         super().__init__(timeout=None)
         self.prediction = prediction
-        self.update_task = None  # Initialize the update task
+        self.stored_interaction = None
+        self.update_task = None
+        self.votes = {option: set() for option in prediction.options}  # Track votes for each option
+
         self.start_auto_update()  # Start the auto-update task
 
+        # Add buttons for each option
         for option in prediction.options:
-            self.add_item(ResolutionButton(option, prediction))
+            self.add_item(ResolutionButton(option, prediction, self))
 
     def start_auto_update(self):
         """Start the auto-update task"""
@@ -519,7 +521,7 @@ class ResolutionView(discord.ui.View):
         try:
             while True:
                 await self.refresh_view()
-                await asyncio.sleep(5)  # Wait 5 seconds before the next update
+                await asyncio.sleep(5)  # Wait 5 seconds before next update
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -540,7 +542,7 @@ class ResolutionView(discord.ui.View):
 
             # Add fields for each option with the current vote count
             for option in self.prediction.options:
-                vote_count = len(self.prediction.bets[option])  # Get the number of votes for the option
+                vote_count = len(self.votes[option])  # Get the number of votes for the option
                 embed.add_field(name=option, value=f"Votes: {vote_count}", inline=False)
 
             # Update the interaction with the new embed
@@ -1114,7 +1116,7 @@ class ListPredictionsView(discord.ui.View):
                 for question, prediction, prices, creator_id in pending_resolution_markets:
                     creator_name = (await self.cog.bot.fetch_user(creator_id)).name
                     current_embed.add_field(
-                        name=f"��� {question} (Created by: {creator_name})",
+                        name=f" {question} (Created by: {creator_name})",
                         value=self.create_market_display(prediction, prices),
                         inline=False
                     )
