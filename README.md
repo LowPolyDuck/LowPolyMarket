@@ -164,7 +164,7 @@ DRIP API key and realm ID can be found in your DRIP Admin channel in the server 
 pip install -r requirements.txt
 ```
 3. Configure environment variables
-4. Run the bot:
+4. Run the bot
 ```bash
 python bot.py
 ```
